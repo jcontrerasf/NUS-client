@@ -1,0 +1,21 @@
+[package]
+name = "nus-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+btleplug = "0.13.3"
+chrono = "0.4.45"
+directories = "6.0.0"
+eframe = "0.36.2"
+futures = "0.3.34"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+toml = "1.1.6"
+uuid = { version = "1.26.1", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+strip = true
