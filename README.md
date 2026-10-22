@@ -71,6 +71,10 @@ cargo build --release
 Sin dependencias extra (toolchain MSVC recomendada). Bluetooth debe estar activado
 en la configuración del sistema.
 
+En Windows la GUI usa DX12 (con OpenGL de respaldo) en lugar de Vulkan, porque
+algunos drivers/capas Vulkan cierran la app al crear la ventana. Se puede forzar
+otro backend con la variable `WGPU_BACKEND` (`vulkan`, `dx12`, `gl`).
+
 ## Notas
 
 - Si un dispositivo no aparece en Linux tras conectarlo antes, puede estar en caché de

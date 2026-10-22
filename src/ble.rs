@@ -243,6 +243,13 @@ impl Worker {
                 tokio::time::timeout(CONNECT_TIMEOUT, p.connect())
                     .await
                     .map_err(|_| anyhow!("tiempo de conexión agotado"))?
+                    .map_err(|e| match e {
+                        // WinRT no distingue "fuera de alcance" de "no conectable".
+                        btleplug::Error::DeviceNotFound => {
+                            anyhow!("dispositivo no encontrado (fuera de alcance o no conectable)")
+                        }
+                        e => anyhow!(e),
+                    })
                     .context("fallo al conectar")?;
             }
             tokio::time::timeout(DISCOVER_TIMEOUT, p.discover_services())
