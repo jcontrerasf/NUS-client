@@ -7,8 +7,15 @@ Funciona en Linux (BlueZ) y Windows 10/11 (WinRT).
 
 ## Funciones
 
-- Escaneo de dispositivos (nombre, dirección, RSSI, marca `[NUS]`), filtro "Sólo NUS".
+- Interfaz con tema oscuro y claro (botón sol/luna o ⚙ Ajustes) e iconos
+  [Phosphor](https://phosphoricons.com) vía `egui-phosphor`.
+- Escaneo de dispositivos en tarjetas (nombre, MAC, nivel de señal, marca `NUS`).
   Doble clic en un dispositivo para conectar.
+- **Filtros** de la lista de dispositivos, combinables:
+  - Búsqueda por nombre o por **cualquier parte de la MAC**, sin importar mayúsculas
+    ni separadores (`a4c1`, `C1:38` o `38-e2` encuentran `A4:C1:38:E2:…`).
+  - **RSSI mínimo** con un deslizador (−100 … −30 dBm).
+  - "Sólo NUS".
 - Usa por defecto NUS: servicio `6E400001-…`, escritura `6E400002-…`, notificación `6E400003-…`.
 - Panel **Servicios**: muestra todos los servicios/características descubiertos con sus
   propiedades y permite elegir otra característica de escritura y/o de notificación.
@@ -17,7 +24,8 @@ Funciona en Linux (BlueZ) y Windows 10/11 (WinRT).
 - Entrada de texto con fin de línea configurable (Ninguno / CR / LF / CR+LF) e historial (↑/↓).
 - **Macros**: botones de comandos predefinidos. Modo *Enviar* (envía al pulsar) o
   *Insertar* (lo copia a la entrada para completarlo). Editables desde la app.
-- **Log** de sesión a archivo con timestamps (ruta automática o elegida con 📁).
+- **Log** de sesión a archivo con timestamps (botón de grabar para ruta automática o
+  carpeta para elegir archivo).
 - Escrituras troceadas según MTU (o tamaño fijo), con o sin respuesta.
 
 ## Configuración
@@ -36,6 +44,8 @@ write_with_response = false
 timestamps = true
 echo = true
 only_nus = false
+dark_mode = true              # tema oscuro (false = claro)
+min_rssi = -80                # filtro RSSI mínimo; omitir para desactivarlo
 default_write_uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 default_notify_uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
@@ -79,7 +89,7 @@ otro backend con la variable `WGPU_BACKEND` (`vulkan`, `dx12`, `gl`).
 
 - Si un dispositivo no aparece en Linux tras conectarlo antes, puede estar en caché de
   BlueZ: aparecerá al escanear de todos modos ("Vaciar" limpia la lista visible).
-- Si los mensajes largos se cortan, baja el *tamaño de trozo* en ⚙ Ajustes (p.ej. 20).
+- Si los mensajes largos se cortan, baja el *tamaño de trozo* en Ajustes (p.ej. 20).
 
 ## Tests
 

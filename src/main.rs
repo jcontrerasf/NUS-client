@@ -6,6 +6,7 @@ mod ble;
 mod config;
 mod log;
 mod messages;
+mod theme;
 
 use eframe::egui;
 
@@ -22,9 +23,11 @@ fn main() -> eframe::Result {
         "NUS Client",
         options,
         Box::new(|cc| {
+            install_fonts(&cc.egui_ctx);
             add_symbol_fallback(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx);
             let (cmd_tx, evt_rx) = ble::spawn(cc.egui_ctx.clone());
-            Ok(Box::new(app::NusApp::new(cmd_tx, evt_rx)))
+            Ok(Box::new(app::NusApp::new(&cc.egui_ctx, cmd_tx, evt_rx)))
         }),
     )
 }
@@ -44,8 +47,21 @@ fn wgpu_options() -> eframe::WgpuConfiguration {
     opts
 }
 
+/// Iconos Phosphor: la variante regular se mezcla con el texto normal y la
+/// rellena queda disponible como familia `phosphor-fill` (ver `theme::FILL`).
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    egui_phosphor::add_font_bytes_as_family(
+        &mut fonts,
+        theme::FILL,
+        egui_phosphor::Variant::Fill.font_bytes(),
+    );
+    ctx.set_fonts(fonts);
+}
+
 /// Las fuentes de egui no traen algunos símbolos de la UI (●, ➤, ⏺…), que
-/// salen como cuadros. En Windows se usa Segoe UI Symbol como respaldo.
+/// salen como cuadros (p.ej. en datos recibidos). En Windows se usa Segoe UI Symbol como respaldo.
 fn add_symbol_fallback(ctx: &egui::Context) {
     if !cfg!(windows) {
         return;

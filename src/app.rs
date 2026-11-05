@@ -6,7 +6,11 @@ use std::sync::mpsc::Receiver;
 use btleplug::api::CharPropFlags;
 use btleplug::platform::PeripheralId;
 use chrono::{DateTime, Local};
-use eframe::egui::{self, Color32, Key, RichText};
+use eframe::egui::text::{LayoutJob, TextFormat};
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, Key, Layout, Margin, RichText, Sense, Stroke, vec2,
+};
+use egui_phosphor::regular as icon;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
@@ -15,9 +19,12 @@ use crate::config::{
 };
 use crate::log::SessionLog;
 use crate::messages::{BleCommand, BleEvent, CharRef, DeviceInfo, Selection, ServiceInfo};
+use crate::theme::{self, Palette, mix};
 
 const MAX_LINES: usize = 20_000;
 const MAX_HISTORY: usize = 100;
+/// Valor inicial del filtro de RSSI al activarlo.
+const DEFAULT_MIN_RSSI: i16 = -80;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LineKind {
@@ -28,24 +35,43 @@ enum LineKind {
 }
 
 impl LineKind {
-    fn color(self, dark: bool) -> Color32 {
-        match (self, dark) {
-            (Self::Rx, true) => Color32::from_rgb(120, 220, 140),
-            (Self::Rx, false) => Color32::from_rgb(0, 120, 40),
-            (Self::Tx, true) => Color32::from_rgb(120, 180, 255),
-            (Self::Tx, false) => Color32::from_rgb(20, 80, 200),
-            (Self::Info, true) => Color32::from_gray(160),
-            (Self::Info, false) => Color32::from_gray(100),
-            (Self::Error, _) => Color32::from_rgb(230, 70, 70),
+    /// Color de la etiqueta.
+    fn color(self, p: &Palette) -> Color32 {
+        match self {
+            Self::Rx => p.rx,
+            Self::Tx => p.tx,
+            Self::Info => p.text_dim,
+            Self::Error => p.error,
         }
     }
 
+    /// Color del texto de la línea.
+    fn text_color(self, p: &Palette) -> Color32 {
+        match self {
+            Self::Rx => p.text,
+            Self::Tx => p.tx,
+            Self::Info => p.text_dim,
+            Self::Error => p.error,
+        }
+    }
+
+    /// Etiqueta en el log y al copiar.
     fn tag(self) -> &'static str {
         match self {
             Self::Rx => "RX",
             Self::Tx => "TX",
             Self::Info => "--",
             Self::Error => "!!",
+        }
+    }
+
+    /// Etiqueta en pantalla (ancho fijo).
+    fn chip(self) -> &'static str {
+        match self {
+            Self::Rx => "  RX  ",
+            Self::Tx => "  TX  ",
+            Self::Info => " INFO ",
+            Self::Error => " ERR  ",
         }
     }
 }
@@ -63,6 +89,49 @@ enum ConnState {
     Connected(String),
 }
 
+/// Filtro de la lista de dispositivos.
+struct DeviceFilter<'a> {
+    /// Texto buscado en el nombre o en cualquier parte de la MAC.
+    query: &'a str,
+    min_rssi: Option<i16>,
+    only_nus: bool,
+}
+
+impl DeviceFilter<'_> {
+    fn is_active(&self) -> bool {
+        !self.query.trim().is_empty() || self.min_rssi.is_some() || self.only_nus
+    }
+
+    fn matches(&self, name: Option<&str>, address: &str, rssi: Option<i16>, has_nus: bool) -> bool {
+        if self.only_nus && !has_nus {
+            return false;
+        }
+        if let Some(min) = self.min_rssi
+            && rssi.is_none_or(|r| r < min)
+        {
+            return false;
+        }
+        let query = self.query.trim();
+        if query.is_empty() {
+            return true;
+        }
+        let lower = query.to_lowercase();
+        if name.is_some_and(|n| n.to_lowercase().contains(&lower)) {
+            return true;
+        }
+        let mac = normalize_mac(query);
+        !mac.is_empty() && normalize_mac(address).contains(&mac)
+    }
+}
+
+/// MAC (o fragmento) sin separadores y en minúsculas: "A4:C1-38" → "a4c138".
+fn normalize_mac(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 pub struct NusApp {
     cmd_tx: UnboundedSender<BleCommand>,
     evt_rx: Receiver<BleEvent>,
@@ -72,6 +141,9 @@ pub struct NusApp {
     scanning: bool,
     devices: HashMap<PeripheralId, DeviceInfo>,
     selected_device: Option<PeripheralId>,
+    /// Dispositivo al que se está conectado (o conectando).
+    connected_device: Option<PeripheralId>,
+    search: String,
     conn: ConnState,
     mtu: u16,
     services: Vec<ServiceInfo>,
@@ -94,8 +166,13 @@ pub struct NusApp {
 }
 
 impl NusApp {
-    pub fn new(cmd_tx: UnboundedSender<BleCommand>, evt_rx: Receiver<BleEvent>) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        cmd_tx: UnboundedSender<BleCommand>,
+        evt_rx: Receiver<BleEvent>,
+    ) -> Self {
         let (config, warning) = Config::load();
+        theme::set_dark(ctx, config.dark_mode);
         let mut app = Self {
             cmd_tx,
             evt_rx,
@@ -104,6 +181,8 @@ impl NusApp {
             scanning: false,
             devices: HashMap::new(),
             selected_device: None,
+            connected_device: None,
+            search: String::new(),
             conn: ConnState::Disconnected,
             mtu: 23,
             services: Vec::new(),
@@ -250,6 +329,7 @@ impl NusApp {
                         self.push(LineKind::Info, "Desconectado".into());
                     }
                     self.conn = ConnState::Disconnected;
+                    self.connected_device = None;
                     self.services.clear();
                     self.selection = Selection::default();
                 }
@@ -257,8 +337,12 @@ impl NusApp {
         }
     }
 
+    fn is_connected(&self) -> bool {
+        matches!(self.conn, ConnState::Connected(_))
+    }
+
     fn send_text(&mut self, text: &str) {
-        if !matches!(self.conn, ConnState::Connected(_)) {
+        if !self.is_connected() {
             self.push(LineKind::Error, "No hay conexión".into());
             return;
         }
@@ -274,6 +358,11 @@ impl NusApp {
     }
 
     fn submit_input(&mut self) {
+        if !self.is_connected() {
+            // Se conserva el texto para enviarlo cuando haya conexión.
+            self.push(LineKind::Error, "No hay conexión".into());
+            return;
+        }
         let text = std::mem::take(&mut self.input);
         if !text.is_empty() && self.history.last() != Some(&text) {
             self.history.push(text.clone());
@@ -294,6 +383,7 @@ impl NusApp {
 
     fn connect_selected(&mut self) {
         if let Some(id) = self.selected_device.clone() {
+            self.connected_device = Some(id.clone());
             self.command(BleCommand::Connect {
                 id,
                 prefer_write: self.config.default_write_uuid,
@@ -325,6 +415,37 @@ impl NusApp {
         }
     }
 
+    fn choose_log_file(&mut self) {
+        let default = SessionLog::default_path();
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("Log", &["log", "txt"])
+            .set_file_name(
+                default
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        if let Some(dir) = default.parent() {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(path) = dlg.save_file() {
+            self.log = None;
+            self.toggle_log(Some(path));
+        }
+    }
+
+    fn clear_terminal(&mut self) {
+        self.lines.clear();
+        self.rx_buf.clear();
+        self.rx_open = false;
+    }
+
+    fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
+        self.config.dark_mode = dark;
+        theme::set_dark(ctx, dark);
+        self.config_dirty = true;
+    }
+
     fn save_config(&mut self) {
         self.config_dirty = false;
         if let Err(e) = self.config.save() {
@@ -338,113 +459,162 @@ impl NusApp {
     // -------------------------------------------------------------------- UI
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if self.scanning {
-                if ui.button("⏹ Detener").clicked() {
-                    self.command(BleCommand::StopScan);
-                }
-                ui.spinner();
-            } else if ui.button("🔍 Escanear").clicked() {
-                self.command(BleCommand::StartScan);
-            }
+        let p = Palette::of(ui);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(icon::BLUETOOTH).size(22.0).color(p.accent));
+            ui.label(RichText::new("NUS Client").size(16.0).strong());
+            ui.add_space(12.0);
+            self.status_pill(ui);
 
-            match &self.conn {
-                ConnState::Disconnected => {
-                    let enabled = self.selected_device.is_some();
-                    if ui
-                        .add_enabled(enabled, egui::Button::new("🔗 Conectar"))
+            theme::right_aligned(ui, 32.0, |ui| {
+                let ctx = ui.ctx().clone();
+                let (theme_icon, theme_tip) = if self.config.dark_mode {
+                    (icon::SUN, "Cambiar a tema claro")
+                } else {
+                    (icon::MOON, "Cambiar a tema oscuro")
+                };
+                if theme::icon_button(ui, theme_icon, theme_tip).clicked() {
+                    self.set_dark(&ctx, !self.config.dark_mode);
+                }
+                theme::icon_toggle(ui, &mut self.show_settings, icon::GEAR_SIX, "Ajustes");
+                theme::icon_toggle(
+                    ui,
+                    &mut self.show_macro_editor,
+                    icon::LIGHTNING,
+                    "Editar macros",
+                );
+                let has_services = !self.services.is_empty();
+                ui.add_enabled_ui(has_services, |ui| {
+                    theme::icon_toggle(
+                        ui,
+                        &mut self.show_gatt,
+                        icon::TREE_STRUCTURE,
+                        "Panel de servicios",
+                    )
+                    .on_disabled_hover_text("Conéctate a un dispositivo para ver sus servicios");
+                });
+                ui.separator();
+
+                match &self.conn {
+                    ConnState::Disconnected => {
+                        let enabled = self.selected_device.is_some();
+                        let resp = theme::solid_button(
+                            ui,
+                            theme::label(icon::PLUGS, "Conectar"),
+                            p.accent,
+                            enabled,
+                        )
+                        .on_disabled_hover_text("Selecciona un dispositivo de la lista");
+                        if resp.clicked() {
+                            self.connect_selected();
+                        }
+                    }
+                    ConnState::Connecting(_) | ConnState::Connected(_) => {
+                        if theme::solid_button(
+                            ui,
+                            theme::label(icon::LINK_BREAK, "Desconectar"),
+                            p.error,
+                            true,
+                        )
                         .clicked()
-                    {
-                        self.connect_selected();
+                        {
+                            self.command(BleCommand::Disconnect);
+                        }
                     }
                 }
-                ConnState::Connecting(_) | ConnState::Connected(_) => {
-                    if ui.button("❌ Desconectar").clicked() {
-                        self.command(BleCommand::Disconnect);
-                    }
-                }
-            }
-
-            ui.separator();
-            let status = match &self.conn {
-                ConnState::Disconnected => RichText::new("● Desconectado").color(Color32::GRAY),
-                ConnState::Connecting(n) => RichText::new(format!("● Conectando a {n}…"))
-                    .color(Color32::from_rgb(230, 170, 30)),
-                ConnState::Connected(n) => {
-                    RichText::new(format!("● {n}")).color(Color32::from_rgb(40, 180, 70))
-                }
-            };
-            ui.label(status);
-
-            ui.separator();
-            let mut changed = false;
-            changed |= ui.checkbox(&mut self.config.timestamps, "Hora").changed();
-            changed |= ui.checkbox(&mut self.config.echo, "Eco").changed();
-            self.config_dirty |= changed;
-
-            let log_label = if self.log.is_some() { "⏺ Log" } else { "Log" };
-            if ui
-                .selectable_label(self.log.is_some(), log_label)
-                .on_hover_text("Guardar la sesión en un archivo (ruta automática)")
-                .clicked()
-            {
-                self.toggle_log(None);
-            }
-            if ui
-                .button("📁")
-                .on_hover_text("Elegir archivo de log…")
-                .clicked()
-            {
-                let default = SessionLog::default_path();
-                let mut dlg = rfd::FileDialog::new()
-                    .add_filter("Log", &["log", "txt"])
-                    .set_file_name(
-                        default
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    );
-                if let Some(dir) = default.parent() {
-                    dlg = dlg.set_directory(dir);
-                }
-                if let Some(path) = dlg.save_file() {
-                    self.log = None;
-                    self.toggle_log(Some(path));
-                }
-            }
-            if ui.button("🗑 Limpiar").clicked() {
-                self.lines.clear();
-                self.rx_buf.clear();
-                self.rx_open = false;
-            }
-            if ui.button("📋 Copiar").clicked() {
-                let text = self.terminal_text();
-                ui.ctx().copy_text(text);
-            }
-
-            ui.separator();
-            ui.toggle_value(&mut self.show_gatt, "Servicios");
-            ui.toggle_value(&mut self.show_macro_editor, "Macros");
-            ui.toggle_value(&mut self.show_settings, "⚙ Ajustes");
+            });
         });
     }
 
+    fn status_pill(&self, ui: &mut egui::Ui) {
+        let p = Palette::of(ui);
+        let (color, text) = match &self.conn {
+            ConnState::Disconnected => (p.text_dim, "Desconectado".to_string()),
+            ConnState::Connecting(n) => (p.warn, format!("Conectando a {n}…")),
+            ConnState::Connected(n) => (p.success, format!("{n}  ·  MTU {}", self.mtu)),
+        };
+        egui::Frame::new()
+            .fill(color.gamma_multiply(0.14))
+            .corner_radius(CornerRadius::same(14))
+            .inner_margin(Margin::symmetric(10, 4))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.horizontal(|ui| {
+                    if matches!(self.conn, ConnState::Connecting(_)) {
+                        ui.add(egui::Spinner::new().size(12.0).color(color));
+                    } else {
+                        ui.label(theme::filled(icon::CIRCLE).size(10.0).color(color));
+                    }
+                    ui.label(RichText::new(text).color(color).strong());
+                });
+            });
+        if let Some(log) = &self.log {
+            theme::pill(ui, theme::label(icon::RECORD, "REC"), p.error)
+                .on_hover_text(format!("Guardando log en {}", log.path().display()));
+        }
+    }
+
     fn devices_panel(&mut self, ui: &mut egui::Ui) {
+        let p = Palette::of(ui);
+
+        // Cabecera
         ui.horizontal(|ui| {
-            ui.heading("Dispositivos");
-            if ui.small_button("Vaciar").clicked() {
-                self.devices.clear();
+            theme::section_title(ui, icon::BROADCAST, "Dispositivos");
+            if !self.devices.is_empty() {
+                theme::pill(ui, self.devices.len().to_string(), p.text_dim);
+            }
+            theme::right_aligned(ui, 30.0, |ui| {
+                if theme::icon_button(ui, icon::BROOM, "Vaciar la lista").clicked() {
+                    self.devices.clear();
+                }
+            });
+        });
+
+        // Escanear / detener
+        ui.horizontal(|ui| {
+            let size = [ui.available_width(), 34.0];
+            if self.scanning {
+                ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                let size = [ui.available_width(), 34.0];
+                if ui
+                    .add_sized(
+                        size,
+                        egui::Button::new(theme::label(icon::STOP, "Detener escaneo")),
+                    )
+                    .clicked()
+                {
+                    self.command(BleCommand::StopScan);
+                }
+            } else if ui
+                .add_sized(
+                    size,
+                    egui::Button::new(
+                        RichText::new(theme::label(icon::MAGNIFYING_GLASS, "Escanear"))
+                            .color(p.on_accent)
+                            .strong(),
+                    )
+                    .fill(p.accent),
+                )
+                .clicked()
+            {
+                self.command(BleCommand::StartScan);
             }
         });
-        if ui.checkbox(&mut self.config.only_nus, "Sólo NUS").changed() {
-            self.config_dirty = true;
-        }
-        ui.separator();
+        ui.add_space(2.0);
 
+        // Filtros
+        self.device_filters(ui);
+        ui.add_space(2.0);
+
+        let filter = DeviceFilter {
+            query: &self.search,
+            min_rssi: self.config.min_rssi,
+            only_nus: self.config.only_nus,
+        };
         let mut list: Vec<&DeviceInfo> = self
             .devices
             .values()
-            .filter(|d| !self.config.only_nus || d.has_nus)
+            .filter(|d| filter.matches(d.name.as_deref(), &d.address, d.rssi, d.has_nus))
             .collect();
         list.sort_by(|a, b| {
             b.rssi
@@ -453,32 +623,60 @@ impl NusApp {
                 .then_with(|| a.address.cmp(&b.address))
         });
 
+        let hidden = self.devices.len() - list.len();
+        let mut clear_filters = false;
+        if filter.is_active() && hidden > 0 {
+            ui.horizontal(|ui| {
+                theme::caption(
+                    ui,
+                    format!("Mostrando {} de {}", list.len(), self.devices.len()),
+                );
+                theme::right_aligned(ui, 22.0, |ui| {
+                    let btn = egui::Button::new(
+                        RichText::new(theme::label(icon::FUNNEL_X, "Quitar filtros"))
+                            .small()
+                            .color(p.accent),
+                    )
+                    .frame_when_inactive(false);
+                    clear_filters = ui.add(btn).clicked();
+                });
+            });
+        }
+
         let mut clicked = None;
         let mut double = None;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
                 if list.is_empty() {
-                    ui.weak(if self.scanning {
-                        "Buscando…"
+                    if !self.devices.is_empty() {
+                        theme::empty_state(
+                            ui,
+                            icon::FUNNEL,
+                            "Sin coincidencias",
+                            "Ningún dispositivo coincide con los filtros.",
+                        );
+                    } else if self.scanning {
+                        theme::empty_state(
+                            ui,
+                            icon::BROADCAST,
+                            "Buscando…",
+                            "Los dispositivos cercanos aparecerán aquí.",
+                        );
                     } else {
-                        "Pulsa «Escanear»"
-                    });
+                        theme::empty_state(
+                            ui,
+                            icon::BLUETOOTH,
+                            "Sin dispositivos",
+                            "Pulsa «Escanear» para buscar dispositivos BLE.",
+                        );
+                    }
                 }
                 for d in list {
                     let selected = self.selected_device.as_ref() == Some(&d.id);
-                    let name = d.name.as_deref().unwrap_or("(sin nombre)");
-                    let mut text = format!("{name}\n{}", d.address);
-                    if let Some(r) = d.rssi {
-                        text.push_str(&format!("  {r} dBm"));
-                    }
-                    if d.has_nus {
-                        text.push_str("  [NUS]");
-                    }
-                    let resp = ui.add_sized(
-                        [ui.available_width(), 0.0],
-                        egui::Button::selectable(selected, text),
-                    );
+                    let active = self.connected_device.as_ref() == Some(&d.id);
+                    let resp = device_card(ui, d, selected, active);
                     if resp.clicked() {
                         clicked = Some(d.id.clone());
                     }
@@ -487,32 +685,135 @@ impl NusApp {
                     }
                 }
             });
+
+        if clear_filters {
+            self.search.clear();
+            self.config.min_rssi = None;
+            self.config.only_nus = false;
+            self.config_dirty = true;
+        }
         if let Some(id) = clicked {
             self.selected_device = Some(id);
         }
         if let Some(id) = double {
             self.selected_device = Some(id);
-            self.connect_selected();
+            if self.conn == ConnState::Disconnected {
+                self.connect_selected();
+            }
+        }
+    }
+
+    fn device_filters(&mut self, ui: &mut egui::Ui) {
+        let p = Palette::of(ui);
+
+        // Búsqueda por nombre o MAC
+        egui::Frame::new()
+            .fill(p.field)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(8, 2))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(p.text_dim));
+                    let clear_w = if self.search.is_empty() { 0.0 } else { 26.0 };
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Buscar por nombre o MAC…")
+                            .frame(egui::Frame::NONE)
+                            .margin(Margin::symmetric(2, 6))
+                            .desired_width(ui.available_width() - clear_w),
+                    );
+                    resp.on_hover_text(
+                        "Coincide con el nombre o con cualquier parte de la MAC\n\
+                         (sin importar mayúsculas ni separadores: «a4c1», «C1:38»…)",
+                    );
+                    if !self.search.is_empty()
+                        && ui
+                            .add(
+                                egui::Button::new(RichText::new(icon::X).color(p.text_dim))
+                                    .frame_when_inactive(false)
+                                    .small(),
+                            )
+                            .on_hover_text("Borrar búsqueda")
+                            .clicked()
+                    {
+                        self.search.clear();
+                    }
+                });
+            });
+
+        // Chips: sólo NUS / RSSI mínimo
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if theme::chip_toggle(ui, &mut self.config.only_nus, icon::FUNNEL, "Sólo NUS")
+                .on_hover_text("Mostrar sólo dispositivos que anuncian Nordic UART Service")
+                .changed()
+            {
+                self.config_dirty = true;
+            }
+            let mut rssi_on = self.config.min_rssi.is_some();
+            let rssi_text = match self.config.min_rssi {
+                Some(v) => format!("RSSI ≥ {v} dBm"),
+                None => "RSSI mínimo".to_string(),
+            };
+            if theme::chip_toggle(ui, &mut rssi_on, icon::CELL_SIGNAL_HIGH, &rssi_text)
+                .on_hover_text("Ocultar dispositivos con señal más débil")
+                .changed()
+            {
+                self.config.min_rssi = rssi_on.then_some(DEFAULT_MIN_RSSI);
+                self.config_dirty = true;
+            }
+        });
+
+        if let Some(v) = &mut self.config.min_rssi {
+            ui.horizontal(|ui| {
+                theme::caption(ui, "−100").on_hover_text("Señal débil");
+                // Deja sitio a la etiqueta final para no ensanchar el panel.
+                ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
+                let resp = ui
+                    .add(
+                        egui::Slider::new(v, -100..=-30)
+                            .show_value(false)
+                            .step_by(1.0),
+                    )
+                    .on_hover_text("Arrastra para cambiar el RSSI mínimo");
+                if resp.changed() {
+                    self.config_dirty = true;
+                }
+                theme::caption(ui, "−30").on_hover_text("Señal fuerte");
+            });
         }
     }
 
     fn gatt_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Servicios");
-        if self.services.is_empty() {
-            ui.weak("Conéctate a un dispositivo para ver sus servicios.");
-        } else {
+        let p = Palette::of(ui);
+        ui.horizontal(|ui| {
+            theme::section_title(ui, icon::TREE_STRUCTURE, "Servicios");
+            theme::right_aligned(ui, 30.0, |ui| {
+                if theme::icon_button(ui, icon::X, "Ocultar panel").clicked() {
+                    self.show_gatt = false;
+                }
+            });
+        });
+
+        theme::card_frame(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
             let mut sel = self.selection;
             char_combo(
                 ui,
                 "write_combo",
+                icon::PENCIL_SIMPLE,
                 "Escritura (TX)",
                 &self.services,
                 &mut sel.write,
                 true,
             );
+            ui.add_space(2.0);
             char_combo(
                 ui,
                 "notify_combo",
+                icon::BELL,
                 "Notificación (RX)",
                 &self.services,
                 &mut sel.notify,
@@ -521,9 +822,10 @@ impl NusApp {
             if sel != self.selection {
                 self.command(BleCommand::Select(sel));
             }
+            ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .button("Usar NUS")
+                    .button(theme::label(icon::ARROW_COUNTER_CLOCKWISE, "Usar NUS"))
                     .on_hover_text("Seleccionar las características NUS estándar")
                     .clicked()
                 {
@@ -540,7 +842,7 @@ impl NusApp {
                     self.command(BleCommand::Select(sel));
                 }
                 if ui
-                    .button("Guardar como predeterminadas")
+                    .button(theme::label(icon::FLOPPY_DISK, "Predeterminar"))
                     .on_hover_text("Usar estas características al conectar")
                     .clicked()
                 {
@@ -553,57 +855,104 @@ impl NusApp {
                     self.config_dirty = true;
                 }
             });
-            ui.label(format!("MTU: {}", self.mtu));
-            ui.separator();
+        });
+        ui.add_space(4.0);
 
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    for s in &self.services {
-                        egui::CollapsingHeader::new(RichText::new(uuid_label(s.uuid)).strong())
-                            .id_salt(s.uuid)
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                for c in &s.chars {
-                                    let r = CharRef {
-                                        service: s.uuid,
-                                        uuid: c.uuid,
-                                    };
-                                    let mut marks = String::new();
-                                    if self.selection.write == Some(r) {
-                                        marks.push_str(" ✏");
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for s in &self.services {
+                    theme::card_frame(ui)
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let title = uuid_name(s.uuid)
+                                .map_or_else(|| "Servicio".to_string(), str::to_owned);
+                            egui::CollapsingHeader::new(RichText::new(title).strong())
+                                .id_salt(s.uuid)
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    theme::caption(ui, s.uuid.to_string());
+                                    for c in &s.chars {
+                                        ui.add_space(2.0);
+                                        self.char_row(ui, p, s.uuid, c.uuid, c.props);
                                     }
-                                    if self.selection.notify == Some(r) {
-                                        marks.push_str(" 🔔");
-                                    }
-                                    ui.label(
-                                        RichText::new(format!("{}{marks}", uuid_label(c.uuid)))
-                                            .monospace(),
-                                    );
-                                    ui.weak(props_label(c.props));
-                                }
-                            });
+                                });
+                        });
+                }
+            });
+    }
+
+    fn char_row(
+        &self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        service: Uuid,
+        uuid: Uuid,
+        props: CharPropFlags,
+    ) {
+        let r = CharRef { service, uuid };
+        egui::Frame::new()
+            .fill(p.raised.gamma_multiply(0.6))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let title =
+                        uuid_name(uuid).map_or_else(|| "Característica".to_string(), str::to_owned);
+                    ui.label(RichText::new(title).strong());
+                    if self.selection.write == Some(r) {
+                        theme::pill(ui, theme::label(icon::PENCIL_SIMPLE, "TX"), p.tx)
+                            .on_hover_text("Característica de escritura activa");
+                    }
+                    if self.selection.notify == Some(r) {
+                        theme::pill(ui, theme::label(icon::BELL, "RX"), p.rx)
+                            .on_hover_text("Característica de notificación activa");
                     }
                 });
-        }
+                ui.label(
+                    RichText::new(uuid.to_string())
+                        .monospace()
+                        .size(11.0)
+                        .color(p.text_dim),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for name in props_names(props) {
+                        theme::pill(ui, name, p.text_dim);
+                    }
+                });
+            });
     }
 
     fn input_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        let p = Palette::of(ui);
+        let connected = self.is_connected();
+
         // Macros
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new(icon::LIGHTNING).color(p.text_dim))
+                .on_hover_text("Macros");
             let mut run = None;
             for (i, m) in self.config.macros.iter().enumerate() {
-                let label = if m.name.is_empty() { &m.text } else { &m.name };
-                let hint = match m.mode {
-                    MacroMode::Send => format!("Enviar: {}", m.text),
-                    MacroMode::Insert => format!("Insertar: {}", m.text),
+                let name = if m.name.is_empty() { &m.text } else { &m.name };
+                let (ic, hint) = match m.mode {
+                    MacroMode::Send => (icon::PAPER_PLANE_TILT, format!("Enviar: {}", m.text)),
+                    MacroMode::Insert => (
+                        icon::CURSOR_TEXT,
+                        format!("Insertar en la entrada: {}", m.text),
+                    ),
                 };
-                if ui.button(label).on_hover_text(hint).clicked() {
+                let btn =
+                    egui::Button::new(theme::label(ic, name)).corner_radius(CornerRadius::same(14));
+                if ui.add(btn).on_hover_text(hint).clicked() {
                     run = Some(i);
                 }
             }
-            if ui.small_button("✏ Editar").clicked() {
+            if theme::icon_button(ui, icon::PENCIL_SIMPLE, "Editar macros").clicked() {
                 self.show_macro_editor = true;
             }
             if let Some(i) = run {
@@ -611,28 +960,51 @@ impl NusApp {
                 self.run_macro(&m);
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(2.0);
+
         // Entrada
-        ui.horizontal(|ui| {
+        theme::right_aligned(ui, 36.0, |ui| {
+            let send_clicked = ui
+                .add_enabled(
+                    connected,
+                    egui::Button::new(
+                        RichText::new(theme::label(icon::PAPER_PLANE_RIGHT, "Enviar"))
+                            .color(p.on_accent)
+                            .strong(),
+                    )
+                    .fill(p.accent)
+                    .min_size(vec2(100.0, 34.0)),
+                )
+                .on_disabled_hover_text("Conéctate a un dispositivo para enviar")
+                .clicked();
+
             let mut le = self.config.line_ending;
             egui::ComboBox::from_id_salt("line_ending")
-                .selected_text(le.label())
-                .width(80.0)
+                .selected_text(theme::label(icon::KEY_RETURN, le.label()))
+                .width(110.0)
+                .height(34.0)
                 .show_ui(ui, |ui| {
                     for opt in LineEnding::ALL {
                         ui.selectable_value(&mut le, opt, opt.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("Fin de línea añadido a cada mensaje");
             if le != self.config.line_ending {
                 self.config.line_ending = le;
                 self.config_dirty = true;
             }
 
-            let send_clicked = ui.button("Enviar ➤").clicked();
+            let hint = if connected {
+                "Escribe un mensaje y pulsa Enter  (↑/↓ historial)"
+            } else {
+                "Conéctate a un dispositivo para enviar mensajes"
+            };
             let edit = egui::TextEdit::singleline(&mut self.input)
-                .hint_text("Escribe un mensaje y pulsa Enter")
+                .hint_text(hint)
                 .font(egui::TextStyle::Monospace)
-                .desired_width(f32::INFINITY);
+                .margin(Margin::symmetric(10, 8))
+                .desired_width(ui.available_width());
             let resp = ui.add(edit);
 
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
@@ -664,29 +1036,143 @@ impl NusApp {
                 resp.request_focus();
             }
         });
-        ui.add_space(4.0);
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
-        let dark = ui.visuals().dark_mode;
-        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        let p = Palette::of(ui);
+        theme::card_frame(ui)
+            .inner_margin(Margin::ZERO)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // Cabecera
+                egui::Frame::new()
+                    .inner_margin(Margin::symmetric(12, 6))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+                        ui.horizontal(|ui| {
+                            // Las acciones ocupan ~300 px; el título sólo si sobra sitio.
+                            let width = ui.available_width();
+                            if width > 360.0 {
+                                ui.label(
+                                    RichText::new(icon::TERMINAL_WINDOW)
+                                        .size(18.0)
+                                        .color(p.accent),
+                                );
+                                ui.label(RichText::new("Terminal").strong());
+                            }
+                            if width > 470.0 && !self.lines.is_empty() {
+                                theme::pill(ui, format!("{} líneas", self.lines.len()), p.text_dim);
+                            }
+                            theme::right_aligned(ui, 30.0, |ui| self.terminal_actions(ui, p));
+                        });
+                    });
+                ui.add(egui::Separator::default().spacing(0.0));
+
+                // Cuerpo
+                egui::Frame::new()
+                    .fill(p.field)
+                    .corner_radius(CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw: 9,
+                        se: 9,
+                    })
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_size(ui.available_size());
+                        if self.lines.is_empty() {
+                            theme::empty_state(
+                                ui,
+                                icon::TERMINAL_WINDOW,
+                                "Sin actividad",
+                                "Los datos enviados y recibidos aparecerán aquí.",
+                            );
+                        } else {
+                            self.terminal_lines(ui, p);
+                        }
+                    });
+            });
+    }
+
+    fn terminal_actions(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if theme::icon_button(ui, icon::TRASH, "Limpiar terminal").clicked() {
+            self.clear_terminal();
+        }
+        if theme::icon_button(ui, icon::COPY, "Copiar todo al portapapeles").clicked() {
+            let text = self.terminal_text();
+            ui.ctx().copy_text(text);
+        }
+        ui.separator();
+        if theme::icon_button(ui, icon::FOLDER_OPEN, "Guardar log en un archivo…").clicked() {
+            self.choose_log_file();
+        }
+        let logging = self.log.is_some();
+        let rec = if logging {
+            theme::filled(icon::RECORD).size(17.0).color(p.error)
+        } else {
+            RichText::new(icon::RECORD).size(17.0)
+        };
+        let tip = if logging {
+            "Detener el log de sesión"
+        } else {
+            "Guardar la sesión en un archivo (ruta automática)"
+        };
+        if ui
+            .add(egui::Button::selectable(logging, rec).min_size(vec2(30.0, 30.0)))
+            .on_hover_text(tip)
+            .clicked()
+        {
+            self.toggle_log(None);
+        }
+        ui.separator();
+        let mut changed = false;
+        changed |= theme::icon_toggle(
+            ui,
+            &mut self.config.echo,
+            icon::ARROWS_LEFT_RIGHT,
+            "Eco local: mostrar lo enviado",
+        )
+        .changed();
+        changed |= theme::icon_toggle(ui, &mut self.config.timestamps, icon::CLOCK, "Mostrar hora")
+            .changed();
+        self.config_dirty |= changed;
+    }
+
+    fn terminal_lines(&self, ui: &mut egui::Ui, p: &Palette) {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 3.0;
         let ts = self.config.timestamps;
         egui::ScrollArea::both()
             .auto_shrink(false)
             .stick_to_bottom(true)
             .show_rows(ui, row_h, self.lines.len(), |ui, range| {
+                ui.spacing_mut().item_spacing.y = 3.0;
                 for line in &self.lines[range] {
-                    let mut s = String::new();
+                    let mut job = LayoutJob::default();
                     if ts {
-                        s.push_str(&line.time.format("%H:%M:%S%.3f ").to_string());
+                        job.append(
+                            &line.time.format("%H:%M:%S%.3f").to_string(),
+                            0.0,
+                            TextFormat::simple(font.clone(), p.text_dim.gamma_multiply(0.8)),
+                        );
                     }
-                    s.push_str(line.kind.tag());
-                    s.push(' ');
-                    s.push_str(&line.text);
-                    ui.add(
-                        egui::Label::new(RichText::new(s).monospace().color(line.kind.color(dark)))
-                            .extend(),
+                    let tag = line.kind.color(p);
+                    job.append(
+                        line.kind.chip(),
+                        if ts { 10.0 } else { 0.0 },
+                        TextFormat {
+                            font_id: font.clone(),
+                            color: tag,
+                            background: tag.gamma_multiply(0.16),
+                            ..Default::default()
+                        },
                     );
+                    job.append(
+                        &line.text,
+                        10.0,
+                        TextFormat::simple(font.clone(), line.kind.text_color(p)),
+                    );
+                    ui.add(egui::Label::new(job).extend());
                 }
             });
     }
@@ -707,78 +1193,107 @@ impl NusApp {
 
     fn macro_editor(&mut self, ctx: &egui::Context) {
         let mut open = self.show_macro_editor;
-        egui::Window::new("Macros")
+        egui::Window::new(theme::label(icon::LIGHTNING, "Macros"))
+            .id(egui::Id::new("macro_editor"))
             .open(&mut open)
-            .default_width(520.0)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .default_width(600.0)
+            .collapsible(false)
             .show(ctx, |ui| {
-                ui.label("Cambios guardados automáticamente en el archivo de configuración.");
-                ui.separator();
+                let p = Palette::of(ui);
+                theme::caption(
+                    ui,
+                    "«Enviar» manda el texto al pulsar el botón; «Insertar» lo copia a la \
+                     entrada para completarlo. Los cambios se guardan automáticamente.",
+                );
+                ui.add_space(4.0);
                 let mut action: Option<(usize, i32)> = None; // (índice, -1 subir / 1 bajar / 0 borrar)
                 let len = self.config.macros.len();
                 egui::ScrollArea::vertical()
                     .max_height(400.0)
                     .show(ui, |ui| {
+                        if len == 0 {
+                            theme::empty_state(
+                                ui,
+                                icon::LIGHTNING,
+                                "Sin macros",
+                                "Añade una para enviar comandos con un clic.",
+                            );
+                            return;
+                        }
                         egui::Grid::new("macro_grid")
                             .striped(true)
                             .num_columns(4)
+                            .spacing(vec2(8.0, 6.0))
                             .show(ui, |ui| {
-                                ui.strong("Nombre");
-                                ui.strong("Texto");
-                                ui.strong("Modo");
+                                for h in ["Nombre", "Texto", "Modo", ""] {
+                                    ui.label(RichText::new(h).small().strong().color(p.text_dim));
+                                }
                                 ui.end_row();
                                 for (i, m) in self.config.macros.iter_mut().enumerate() {
                                     let mut changed = false;
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(&mut m.name)
-                                                .desired_width(110.0),
+                                                .hint_text("Nombre")
+                                                .min_size(vec2(130.0, 0.0))
+                                                .desired_width(130.0),
                                         )
                                         .changed();
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(&mut m.text)
+                                                .hint_text("Texto a enviar")
                                                 .font(egui::TextStyle::Monospace)
-                                                .desired_width(200.0),
+                                                .min_size(vec2(220.0, 0.0))
+                                                .desired_width(220.0),
                                         )
                                         .changed();
+                                    let mode_label = |mode| match mode {
+                                        MacroMode::Send => {
+                                            theme::label(icon::PAPER_PLANE_TILT, "Enviar")
+                                        }
+                                        MacroMode::Insert => {
+                                            theme::label(icon::CURSOR_TEXT, "Insertar")
+                                        }
+                                    };
                                     egui::ComboBox::from_id_salt(("macro_mode", i))
-                                        .selected_text(match m.mode {
-                                            MacroMode::Send => "Enviar",
-                                            MacroMode::Insert => "Insertar",
-                                        })
+                                        .selected_text(mode_label(m.mode))
+                                        .width(110.0)
                                         .show_ui(ui, |ui| {
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut m.mode,
-                                                    MacroMode::Send,
-                                                    "Enviar",
-                                                )
-                                                .changed();
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut m.mode,
-                                                    MacroMode::Insert,
-                                                    "Insertar",
-                                                )
-                                                .changed();
+                                            for mode in [MacroMode::Send, MacroMode::Insert] {
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        &mut m.mode,
+                                                        mode,
+                                                        mode_label(mode),
+                                                    )
+                                                    .changed();
+                                            }
                                         });
                                     ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(i > 0, egui::Button::new("⬆").small())
-                                            .clicked()
-                                        {
-                                            action = Some((i, -1));
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                i + 1 < len,
-                                                egui::Button::new("⬇").small(),
-                                            )
-                                            .clicked()
-                                        {
-                                            action = Some((i, 1));
-                                        }
-                                        if ui.small_button("🗑").clicked() {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        ui.add_enabled_ui(i > 0, |ui| {
+                                            if theme::icon_button(ui, icon::ARROW_UP, "Subir")
+                                                .clicked()
+                                            {
+                                                action = Some((i, -1));
+                                            }
+                                        });
+                                        ui.add_enabled_ui(i + 1 < len, |ui| {
+                                            if theme::icon_button(ui, icon::ARROW_DOWN, "Bajar")
+                                                .clicked()
+                                            {
+                                                action = Some((i, 1));
+                                            }
+                                        });
+                                        let del = egui::Button::new(
+                                            RichText::new(icon::TRASH).size(17.0).color(p.error),
+                                        )
+                                        .frame_when_inactive(false)
+                                        .min_size(vec2(30.0, 30.0));
+                                        if ui.add(del).on_hover_text("Eliminar").clicked() {
                                             action = Some((i, 0));
                                         }
                                     });
@@ -797,8 +1312,8 @@ impl NusApp {
                     }
                     self.config_dirty = true;
                 }
-                ui.separator();
-                if ui.button("➕ Añadir macro").clicked() {
+                ui.add_space(6.0);
+                if theme::accent_button(ui, theme::label(icon::PLUS, "Añadir macro")).clicked() {
                     self.config.macros.push(Macro {
                         name: format!("M{}", self.config.macros.len() + 1),
                         ..Default::default()
@@ -811,43 +1326,110 @@ impl NusApp {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
-        egui::Window::new("Ajustes").open(&mut open).show(ctx, |ui| {
-            let mut changed = false;
-            egui::Grid::new("settings_grid").num_columns(2).show(ui, |ui| {
-                ui.label("Tamaño de trozo (bytes)");
+        egui::Window::new(theme::label(icon::GEAR_SIX, "Ajustes"))
+            .id(egui::Id::new("settings"))
+            .open(&mut open)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .min_width(520.0)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let p = Palette::of(ui);
+                let mut changed = false;
+                let heading = |ui: &mut egui::Ui, ic: &str, text: &str| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(ic).color(p.accent));
+                        ui.label(RichText::new(text).strong());
+                    });
+                };
+
+                heading(ui, icon::PALETTE, "Apariencia");
                 ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut self.config.chunk_size).range(0..=512))
-                        .changed();
-                    ui.weak(format!(
-                        "0 = auto (ahora {})",
-                        config::effective_chunk_size(self.config.chunk_size, self.mtu)
-                    ));
+                    let dark = self.config.dark_mode;
+                    if ui
+                        .selectable_label(dark, theme::label(icon::MOON, "Oscuro"))
+                        .clicked()
+                        && !dark
+                    {
+                        self.set_dark(ctx, true);
+                    }
+                    if ui
+                        .selectable_label(!dark, theme::label(icon::SUN, "Claro"))
+                        .clicked()
+                        && dark
+                    {
+                        self.set_dark(ctx, false);
+                    }
                 });
-                ui.end_row();
+                ui.add_space(6.0);
 
-                ui.label("Escritura con respuesta");
-                changed |= ui
-                    .checkbox(&mut self.config.write_with_response, "")
-                    .on_hover_text("Más lento pero confirmado. Si la característica sólo admite un modo, se usa ese.")
-                    .changed();
-                ui.end_row();
+                heading(ui, icon::PAPER_PLANE_RIGHT, "Escritura");
+                egui::Grid::new("settings_write")
+                    .num_columns(2)
+                    .spacing(vec2(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label("Tamaño de trozo");
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.config.chunk_size)
+                                        .range(0..=512)
+                                        .suffix(" B"),
+                                )
+                                .changed();
+                            theme::caption(
+                                ui,
+                                format!(
+                                    "0 = auto (ahora {} B)",
+                                    config::effective_chunk_size(self.config.chunk_size, self.mtu)
+                                ),
+                            );
+                        });
+                        ui.end_row();
 
-                ui.label("Escritura predeterminada");
-                changed |= uuid_edit(ui, &mut self.config.default_write_uuid);
-                ui.end_row();
+                        ui.label("Con respuesta");
+                        changed |= ui
+                            .checkbox(
+                                &mut self.config.write_with_response,
+                                "Confirmar cada escritura",
+                            )
+                            .on_hover_text(
+                                "Más lento pero confirmado. Si la característica sólo admite \
+                                 un modo, se usa ese.",
+                            )
+                            .changed();
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
 
-                ui.label("Notificación predeterminada");
-                changed |= uuid_edit(ui, &mut self.config.default_notify_uuid);
-                ui.end_row();
+                heading(ui, icon::TREE_STRUCTURE, "Características predeterminadas");
+                egui::Grid::new("settings_uuids")
+                    .num_columns(2)
+                    .spacing(vec2(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(theme::label(icon::PENCIL_SIMPLE, "Escritura"));
+                        changed |= uuid_edit(ui, &mut self.config.default_write_uuid);
+                        ui.end_row();
+
+                        ui.label(theme::label(icon::BELL, "Notificación"));
+                        changed |= uuid_edit(ui, &mut self.config.default_notify_uuid);
+                        ui.end_row();
+                    });
+                ui.add_space(4.0);
+                if ui
+                    .button(theme::label(
+                        icon::ARROW_COUNTER_CLOCKWISE,
+                        "Restaurar UUIDs NUS",
+                    ))
+                    .clicked()
+                {
+                    self.config.default_write_uuid = NUS_RX_WRITE;
+                    self.config.default_notify_uuid = NUS_TX_NOTIFY;
+                    changed = true;
+                }
+                self.config_dirty |= changed;
             });
-            if ui.button("Restaurar UUIDs NUS").clicked() {
-                self.config.default_write_uuid = NUS_RX_WRITE;
-                self.config.default_notify_uuid = NUS_TX_NOTIFY;
-                changed = true;
-            }
-            self.config_dirty |= changed;
-        });
         self.show_settings = open;
     }
 }
@@ -859,24 +1441,45 @@ impl eframe::App for NusApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let p = Palette::of(ui);
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.toolbar(ui);
-            ui.add_space(2.0);
-        });
-        egui::Panel::bottom("input").show(ui, |ui| self.input_panel(ui));
+        egui::Panel::top("toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.surface)
+                    .inner_margin(Margin::symmetric(14, 8)),
+            )
+            .show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("input")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.surface)
+                    .inner_margin(Margin::symmetric(14, 10)),
+            )
+            .show(ui, |ui| self.input_panel(ui));
         egui::Panel::left("devices")
             .resizable(true)
-            .default_size(240.0)
+            .show_separator_line(false)
+            .default_size(290.0)
+            .size_range(210.0..=460.0)
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12)))
             .show(ui, |ui| self.devices_panel(ui));
-        if self.show_gatt {
+        if self.show_gatt && !self.services.is_empty() {
             egui::Panel::right("gatt")
                 .resizable(true)
-                .default_size(320.0)
+                .show_separator_line(false)
+                .default_size(290.0)
+                .size_range(230.0..=520.0)
+                .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::same(12)))
                 .show(ui, |ui| self.gatt_panel(ui));
         }
-        egui::CentralPanel::default_margins().show(ui, |ui| self.terminal(ui));
+        egui::CentralPanel::no_frame()
+            .frame(
+                egui::Frame::new()
+                    .fill(p.bg)
+                    .inner_margin(Margin::symmetric(2, 12)),
+            )
+            .show(ui, |ui| self.terminal(ui));
 
         if self.show_macro_editor {
             self.macro_editor(&ctx);
@@ -899,21 +1502,92 @@ impl eframe::App for NusApp {
 
 // ------------------------------------------------------------------ helpers
 
+/// Tarjeta clicable de un dispositivo de la lista.
+fn device_card(ui: &mut egui::Ui, d: &DeviceInfo, selected: bool, active: bool) -> egui::Response {
+    let p = Palette::of(ui);
+    let id = ui.make_persistent_id(("device", &d.id));
+    let mut prepared = egui::Frame::new()
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(10, 8))
+        .stroke(Stroke::new(1.0, p.border))
+        .begin(ui);
+    {
+        let ui = &mut prepared.content_ui;
+        ui.set_width(ui.available_width());
+        theme::right_aligned(ui, 38.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (sig, color) = theme::signal(d.rssi, p);
+            if let Some(r) = d.rssi {
+                ui.label(RichText::new(format!("{r} dBm")).small().color(p.text_dim));
+            }
+            ui.label(RichText::new(sig).size(18.0).color(color));
+            if d.has_nus {
+                theme::pill(ui, "NUS", p.accent);
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let (ic, ic_color) = if active {
+                    (icon::PLUGS_CONNECTED, p.success)
+                } else if selected {
+                    (icon::BLUETOOTH, p.accent)
+                } else {
+                    (icon::BLUETOOTH, p.text_dim)
+                };
+                ui.label(RichText::new(ic).size(20.0).color(ic_color));
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let name = match d.name.as_deref() {
+                        Some(n) if !n.trim().is_empty() => RichText::new(n).strong().color(p.text),
+                        _ => RichText::new("Sin nombre").italics().color(p.text_dim),
+                    };
+                    ui.add(egui::Label::new(name).truncate().selectable(false));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&d.address)
+                                .monospace()
+                                .size(11.5)
+                                .color(p.text_dim),
+                        )
+                        .truncate()
+                        .selectable(false),
+                    );
+                });
+            });
+        });
+    }
+    let rect = prepared.allocate_space(ui).rect;
+    let resp = ui.interact(rect, id, Sense::click());
+    let (fill, stroke) = if selected {
+        (mix(p.surface, p.accent, 0.16), p.accent)
+    } else if resp.hovered() {
+        (p.raised, mix(p.border, p.accent, 0.4))
+    } else {
+        (p.surface, p.border)
+    };
+    prepared.frame.fill = fill;
+    prepared.frame.stroke = Stroke::new(1.0, stroke);
+    prepared.paint(ui);
+    resp.on_hover_text("Doble clic para conectar")
+}
+
 /// Decodifica UTF-8 (con pérdida) y quita el fin de línea.
 fn decode_line(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
     s.trim_end_matches(['\r', '\n']).replace('\r', "\\r")
 }
 
-/// UUID con nombre si es conocido.
-fn uuid_label(u: Uuid) -> String {
-    let name = match u {
+/// Nombre de un UUID conocido.
+fn uuid_name(u: Uuid) -> Option<&'static str> {
+    match u {
         NUS_SERVICE => Some("NUS"),
         NUS_RX_WRITE => Some("NUS RX"),
         NUS_TX_NOTIFY => Some("NUS TX"),
         _ => short_uuid_name(u),
-    };
-    match name {
+    }
+}
+
+/// UUID con nombre si es conocido.
+fn uuid_label(u: Uuid) -> String {
+    match uuid_name(u) {
         Some(n) => format!("{n} ({u})"),
         None => u.to_string(),
     }
@@ -943,7 +1617,7 @@ fn short_uuid_name(u: Uuid) -> Option<&'static str> {
     })
 }
 
-fn props_label(p: CharPropFlags) -> String {
+fn props_names(p: CharPropFlags) -> Vec<&'static str> {
     let names = [
         (CharPropFlags::READ, "Read"),
         (CharPropFlags::WRITE, "Write"),
@@ -957,25 +1631,34 @@ fn props_label(p: CharPropFlags) -> String {
         .iter()
         .filter(|(f, _)| p.contains(*f))
         .map(|(_, n)| *n)
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
 }
 
 fn char_combo(
     ui: &mut egui::Ui,
     id: &str,
+    icon: &str,
     label: &str,
     services: &[ServiceInfo],
     value: &mut Option<CharRef>,
     write: bool,
 ) {
-    ui.label(label);
-    let selected = value.map_or("(ninguna)".to_string(), |c| uuid_label(c.uuid));
+    let p = Palette::of(ui);
+    ui.label(
+        RichText::new(theme::label(icon, label))
+            .small()
+            .strong()
+            .color(p.text_dim),
+    );
+    let selected = value.map_or("Ninguna".to_string(), |c| {
+        uuid_name(c.uuid).map_or_else(|| c.uuid.to_string(), str::to_owned)
+    });
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected)
         .width(ui.available_width())
+        .truncate()
         .show_ui(ui, |ui| {
-            ui.selectable_value(value, None, "(ninguna)");
+            ui.selectable_value(value, None, "Ninguna");
             for s in services {
                 let chars: Vec<_> = s
                     .chars
@@ -985,7 +1668,7 @@ fn char_combo(
                 if chars.is_empty() {
                     continue;
                 }
-                ui.weak(uuid_label(s.uuid));
+                ui.label(RichText::new(uuid_label(s.uuid)).small().color(p.text_dim));
                 for c in chars {
                     let r = CharRef {
                         service: s.uuid,
@@ -1003,11 +1686,15 @@ fn uuid_edit(ui: &mut egui::Ui, value: &mut Uuid) -> bool {
     let mut text = ui
         .data_mut(|d| d.get_temp::<String>(id))
         .unwrap_or_else(|| value.to_string());
-    let resp = ui.add(
-        egui::TextEdit::singleline(&mut text)
-            .font(egui::TextStyle::Monospace)
-            .desired_width(300.0),
-    );
+    let valid = Uuid::parse_str(text.trim()).is_ok();
+    let mut edit = egui::TextEdit::singleline(&mut text)
+        .font(egui::TextStyle::Monospace)
+        .min_size(vec2(330.0, 0.0))
+        .desired_width(330.0);
+    if !valid {
+        edit = edit.text_color(Palette::of(ui).error);
+    }
+    let resp = ui.add(edit);
     let mut changed = false;
     if resp.changed()
         && let Ok(u) = Uuid::parse_str(text.trim())
@@ -1021,4 +1708,86 @@ fn uuid_edit(ui: &mut egui::Ui, value: &mut Uuid) -> bool {
         ui.data_mut(|d| d.remove::<String>(id));
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADDR: &str = "A4:C1:38:E2:5F:0B";
+
+    fn filter(query: &str) -> DeviceFilter<'_> {
+        DeviceFilter {
+            query,
+            min_rssi: None,
+            only_nus: false,
+        }
+    }
+
+    #[test]
+    fn mac_normalization() {
+        assert_eq!(normalize_mac("A4:C1-38 e2"), "a4c138e2");
+        assert_eq!(normalize_mac(" : - "), "");
+    }
+
+    #[test]
+    fn empty_filter_matches_everything() {
+        let f = filter("  ");
+        assert!(!f.is_active());
+        assert!(f.matches(None, ADDR, None, false));
+    }
+
+    #[test]
+    fn matches_name_case_insensitive() {
+        let f = filter("nordic");
+        assert!(f.matches(Some("My Nordic UART"), ADDR, Some(-50), false));
+        assert!(!f.matches(Some("Sensor"), ADDR, Some(-50), false));
+        assert!(!f.matches(None, ADDR, Some(-50), false));
+    }
+
+    #[test]
+    fn matches_any_part_of_mac() {
+        for q in [
+            "a4c1",
+            "A4:C1",
+            "c1:38",
+            "38E2",
+            "e2-5f",
+            "5f0b",
+            "0B",
+            "a4:c1:38:e2:5f:0b",
+        ] {
+            assert!(filter(q).matches(None, ADDR, None, false), "{q}");
+        }
+        for q in ["a4c2", "c1:39", "zz"] {
+            assert!(!filter(q).matches(None, ADDR, None, false), "{q}");
+        }
+    }
+
+    #[test]
+    fn min_rssi_threshold() {
+        let f = DeviceFilter {
+            query: "",
+            min_rssi: Some(-70),
+            only_nus: false,
+        };
+        assert!(f.is_active());
+        assert!(f.matches(None, ADDR, Some(-70), false));
+        assert!(f.matches(None, ADDR, Some(-40), false));
+        assert!(!f.matches(None, ADDR, Some(-71), false));
+        assert!(!f.matches(None, ADDR, None, false));
+    }
+
+    #[test]
+    fn filters_combine() {
+        let f = DeviceFilter {
+            query: "38e2",
+            min_rssi: Some(-80),
+            only_nus: true,
+        };
+        assert!(f.matches(Some("x"), ADDR, Some(-60), true));
+        assert!(!f.matches(Some("x"), ADDR, Some(-60), false));
+        assert!(!f.matches(Some("x"), ADDR, Some(-90), true));
+        assert!(!f.matches(Some("x"), "00:11:22:33:44:55", Some(-60), true));
+    }
 }

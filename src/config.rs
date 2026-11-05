@@ -73,6 +73,10 @@ pub struct Config {
     pub timestamps: bool,
     pub echo: bool,
     pub only_nus: bool,
+    /// Tema oscuro (true) o claro (false).
+    pub dark_mode: bool,
+    /// Filtro de RSSI mínimo en la lista de dispositivos (None = sin filtro).
+    pub min_rssi: Option<i16>,
     /// Característica de escritura preferida al conectar.
     pub default_write_uuid: Uuid,
     /// Característica de notificación preferida al conectar.
@@ -89,6 +93,8 @@ impl Default for Config {
             timestamps: true,
             echo: true,
             only_nus: false,
+            dark_mode: true,
+            min_rssi: None,
             default_write_uuid: NUS_RX_WRITE,
             default_notify_uuid: NUS_TX_NOTIFY,
             macros: vec![
@@ -193,6 +199,8 @@ mod tests {
         let mut cfg = Config {
             line_ending: LineEnding::Lf,
             chunk_size: 100,
+            dark_mode: false,
+            min_rssi: Some(-70),
             ..Default::default()
         };
         cfg.macros.push(Macro {
@@ -213,6 +221,8 @@ mod tests {
         assert_eq!(cfg.default_write_uuid, NUS_RX_WRITE);
         assert_eq!(cfg.macros.len(), 1);
         assert_eq!(cfg.macros[0].mode, MacroMode::Send);
+        assert!(cfg.dark_mode);
+        assert_eq!(cfg.min_rssi, None);
     }
 
     #[test]
