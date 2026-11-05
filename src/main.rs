@@ -15,7 +15,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("NUS Client")
             .with_inner_size([1100.0, 700.0])
-            .with_min_inner_size([640.0, 400.0]),
+            .with_min_inner_size([640.0, 400.0])
+            .with_app_id("nus-client")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/nus-client-64.png"))
+                    .expect("ícono PNG válido"),
+            ),
         wgpu_options: wgpu_options(),
         ..Default::default()
     };

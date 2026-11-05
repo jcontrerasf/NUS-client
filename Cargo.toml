@@ -1,7 +1,10 @@
 [package]
 name = "nus-client"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
+authors = ["Julio Contreras"]
+description = "Desktop BLE client for Nordic UART Service (NUS) devices"
+repository = "https://github.com/jcontrerasf/NUS-client"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -16,6 +19,31 @@ serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 toml = "1.1.6"
 uuid = { version = "1.26.1", features = ["serde"] }
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.31"
+
+[package.metadata.deb]
+name = "nus-client"
+maintainer = "Julio Contreras"
+section = "utils"
+extended-description = """\
+Cliente BLE de escritorio para dispositivos con Nordic UART Service (NUS), al estilo de \
+Serial Bluetooth Terminal: escaneo con filtros, terminal RX/TX, macros, log de sesión y \
+selección de características GATT."""
+depends = "$auto, bluez"
+assets = [
+    ["target/release/nus-client", "usr/bin/", "755"],
+    ["packaging/linux/nus-client.desktop", "usr/share/applications/", "644"],
+    ["assets/nus-client.svg", "usr/share/icons/hicolor/scalable/apps/nus-client.svg", "644"],
+    ["assets/nus-client-16.png", "usr/share/icons/hicolor/16x16/apps/nus-client.png", "644"],
+    ["assets/nus-client-32.png", "usr/share/icons/hicolor/32x32/apps/nus-client.png", "644"],
+    ["assets/nus-client-48.png", "usr/share/icons/hicolor/48x48/apps/nus-client.png", "644"],
+    ["assets/nus-client-64.png", "usr/share/icons/hicolor/64x64/apps/nus-client.png", "644"],
+    ["assets/nus-client-128.png", "usr/share/icons/hicolor/128x128/apps/nus-client.png", "644"],
+    ["assets/nus-client-256.png", "usr/share/icons/hicolor/256x256/apps/nus-client.png", "644"],
+    ["assets/nus-client-512.png", "usr/share/icons/hicolor/512x512/apps/nus-client.png", "644"],
+]
 
 [profile.release]
 opt-level = 3

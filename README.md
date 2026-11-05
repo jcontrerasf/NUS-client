@@ -28,6 +28,17 @@ Funciona en Linux (BlueZ) y Windows 10/11 (WinRT).
   carpeta para elegir archivo).
 - Escrituras troceadas según MTU (o tamaño fijo), con o sin respuesta.
 
+## Descargas
+
+En [Releases](https://github.com/jcontrerasf/NUS-client/releases) hay paquetes de cada versión:
+
+- **Linux**: `.deb` (Debian/Ubuntu) y `.AppImage` (cualquier distro; `chmod +x` y ejecutar).
+  Requiere BlueZ.
+- **Windows 10/11**: `.exe` autónomo, sin instalación.
+
+Se generan con GitHub Actions (`.github/workflows/release.yml`) al subir un tag `vX.Y.Z`
+que coincida con la versión de `Cargo.toml`.
+
 ## Configuración
 
 Se guarda automáticamente en:

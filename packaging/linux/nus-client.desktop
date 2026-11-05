@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=NUS Client
+GenericName=BLE UART Terminal
+GenericName[es]=Terminal BLE UART
+Comment=Desktop BLE client for Nordic UART Service devices
+Comment[es]=Cliente BLE de escritorio para dispositivos con Nordic UART Service
+Exec=nus-client
+Icon=nus-client
+Terminal=false
+Categories=Development;Utility;
+Keywords=bluetooth;ble;uart;nus;nordic;serial;terminal;
+StartupWMClass=nus-client
